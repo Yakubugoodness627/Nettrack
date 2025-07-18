@@ -11,10 +11,16 @@
 (define-constant err-invalid-qr (err u106))
 (define-constant err-center-inactive (err u107))
 (define-constant err-recipient-exists (err u108))
+(define-constant err-equipment-not-found (err u109))
+(define-constant err-equipment-already-exists (err u110))
+(define-constant err-equipment-maintenance-overdue (err u111))
+(define-constant err-equipment-inactive (err u112))
+(define-constant err-invalid-equipment-type (err u113))
 
 (define-data-var total-nets-distributed uint u0)
 (define-data-var total-distribution-centers uint u0)
 (define-data-var contract-active bool true)
+(define-data-var total-equipment uint u0)
 
 (define-map distribution-centers
   { center-id: uint }
@@ -68,6 +74,58 @@
 )
 
 (define-data-var next-log-id uint u1)
+
+(define-map equipment
+  { equipment-id: uint }
+  {
+    name: (string-ascii 100),
+    equipment-type: (string-ascii 50),
+    center-id: uint,
+    purchase-date: uint,
+    last-maintenance: uint,
+    next-maintenance: uint,
+    maintenance-interval: uint,
+    condition: (string-ascii 20),
+    active: bool,
+    total-maintenance-cost: uint,
+    maintenance-count: uint,
+    manufacturer: (string-ascii 100),
+    model: (string-ascii 100),
+    serial-number: (string-ascii 100)
+  }
+)
+
+(define-map maintenance-records
+  { record-id: uint }
+  {
+    equipment-id: uint,
+    maintenance-type: (string-ascii 50),
+    performed-by: principal,
+    maintenance-date: uint,
+    cost: uint,
+    description: (string-ascii 200),
+    next-due-date: uint,
+    parts-replaced: (string-ascii 200),
+    duration-hours: uint
+  }
+)
+
+(define-map equipment-alerts
+  { alert-id: uint }
+  {
+    equipment-id: uint,
+    alert-type: (string-ascii 50),
+    severity: (string-ascii 20),
+    message: (string-ascii 200),
+    created-at: uint,
+    resolved: bool,
+    resolved-at: (optional uint),
+    resolved-by: (optional principal)
+  }
+)
+
+(define-data-var next-maintenance-record-id uint u1)
+(define-data-var next-alert-id uint u1)
 
 (define-public (initialize-contract)
   (begin
@@ -343,5 +401,235 @@
       })
       err-not-found
     )
+  )
+)
+
+(define-public (add-equipment (name (string-ascii 100)) (equipment-type (string-ascii 50)) (center-id uint) (maintenance-interval uint) (manufacturer (string-ascii 100)) (model (string-ascii 100)) (serial-number (string-ascii 100)))
+  (let (
+    (equipment-id (+ (var-get total-equipment) u1))
+    (center (unwrap! (map-get? distribution-centers { center-id: center-id }) err-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> (len name) u0) err-invalid-equipment-type)
+    (asserts! (> (len equipment-type) u0) err-invalid-equipment-type)
+    (asserts! (> maintenance-interval u0) err-invalid-equipment-type)
+    (map-set equipment
+      { equipment-id: equipment-id }
+      {
+        name: name,
+        equipment-type: equipment-type,
+        center-id: center-id,
+        purchase-date: stacks-block-height,
+        last-maintenance: stacks-block-height,
+        next-maintenance: (+ stacks-block-height maintenance-interval),
+        maintenance-interval: maintenance-interval,
+        condition: "excellent",
+        active: true,
+        total-maintenance-cost: u0,
+        maintenance-count: u0,
+        manufacturer: manufacturer,
+        model: model,
+        serial-number: serial-number
+      }
+    )
+    (var-set total-equipment equipment-id)
+    (ok equipment-id)
+  )
+)
+
+(define-public (perform-maintenance (equipment-id uint) (maintenance-type (string-ascii 50)) (cost uint) (description (string-ascii 200)) (parts-replaced (string-ascii 200)) (duration-hours uint))
+  (let (
+    (equip (unwrap! (map-get? equipment { equipment-id: equipment-id }) err-equipment-not-found))
+    (record-id (var-get next-maintenance-record-id))
+    (new-next-maintenance (+ stacks-block-height (get maintenance-interval equip)))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get active equip) err-equipment-inactive)
+    (asserts! (> (len maintenance-type) u0) err-invalid-equipment-type)
+    
+    (map-set maintenance-records
+      { record-id: record-id }
+      {
+        equipment-id: equipment-id,
+        maintenance-type: maintenance-type,
+        performed-by: tx-sender,
+        maintenance-date: stacks-block-height,
+        cost: cost,
+        description: description,
+        next-due-date: new-next-maintenance,
+        parts-replaced: parts-replaced,
+        duration-hours: duration-hours
+      }
+    )
+    
+    (map-set equipment
+      { equipment-id: equipment-id }
+      (merge equip {
+        last-maintenance: stacks-block-height,
+        next-maintenance: new-next-maintenance,
+        total-maintenance-cost: (+ (get total-maintenance-cost equip) cost),
+        maintenance-count: (+ (get maintenance-count equip) u1),
+        condition: (if (>= cost u1000) "fair" "good")
+      })
+    )
+    
+    (var-set next-maintenance-record-id (+ record-id u1))
+    (ok record-id)
+  )
+)
+
+(define-public (create-equipment-alert (equipment-id uint) (alert-type (string-ascii 50)) (severity (string-ascii 20)) (message (string-ascii 200)))
+  (let (
+    (equip (unwrap! (map-get? equipment { equipment-id: equipment-id }) err-equipment-not-found))
+    (alert-id (var-get next-alert-id))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get active equip) err-equipment-inactive)
+    (asserts! (> (len alert-type) u0) err-invalid-equipment-type)
+    (asserts! (> (len message) u0) err-invalid-equipment-type)
+    
+    (map-set equipment-alerts
+      { alert-id: alert-id }
+      {
+        equipment-id: equipment-id,
+        alert-type: alert-type,
+        severity: severity,
+        message: message,
+        created-at: stacks-block-height,
+        resolved: false,
+        resolved-at: none,
+        resolved-by: none
+      }
+    )
+    
+    (var-set next-alert-id (+ alert-id u1))
+    (ok alert-id)
+  )
+)
+
+(define-public (resolve-equipment-alert (alert-id uint))
+  (let (
+    (alert (unwrap! (map-get? equipment-alerts { alert-id: alert-id }) err-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (get resolved alert)) err-already-exists)
+    
+    (map-set equipment-alerts
+      { alert-id: alert-id }
+      (merge alert {
+        resolved: true,
+        resolved-at: (some stacks-block-height),
+        resolved-by: (some tx-sender)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-equipment (equipment-id uint))
+  (let (
+    (equip (unwrap! (map-get? equipment { equipment-id: equipment-id }) err-equipment-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get active equip) err-equipment-inactive)
+    
+    (map-set equipment
+      { equipment-id: equipment-id }
+      (merge equip { active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-equipment-condition (equipment-id uint) (new-condition (string-ascii 20)))
+  (let (
+    (equip (unwrap! (map-get? equipment { equipment-id: equipment-id }) err-equipment-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get active equip) err-equipment-inactive)
+    (asserts! (> (len new-condition) u0) err-invalid-equipment-type)
+    
+    (map-set equipment
+      { equipment-id: equipment-id }
+      (merge equip { condition: new-condition })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-equipment (equipment-id uint))
+  (map-get? equipment { equipment-id: equipment-id })
+)
+
+(define-read-only (get-maintenance-record (record-id uint))
+  (map-get? maintenance-records { record-id: record-id })
+)
+
+(define-read-only (get-equipment-alert (alert-id uint))
+  (map-get? equipment-alerts { alert-id: alert-id })
+)
+
+(define-read-only (get-total-equipment)
+  (var-get total-equipment)
+)
+
+(define-read-only (get-equipment-maintenance-status (equipment-id uint))
+  (let (
+    (equip (unwrap! (map-get? equipment { equipment-id: equipment-id }) err-equipment-not-found))
+    (current-block stacks-block-height)
+    (next-maintenance (get next-maintenance equip))
+    (days-until-maintenance (if (>= next-maintenance current-block) (- next-maintenance current-block) u0))
+    (overdue (< next-maintenance current-block))
+  )
+    (ok {
+      equipment-id: equipment-id,
+      condition: (get condition equip),
+      last-maintenance: (get last-maintenance equip),
+      next-maintenance: next-maintenance,
+      days-until-maintenance: days-until-maintenance,
+      overdue: overdue,
+      maintenance-count: (get maintenance-count equip),
+      total-cost: (get total-maintenance-cost equip)
+    })
+  )
+)
+
+(define-read-only (get-center-equipment (center-id uint))
+  (let (
+    (center (unwrap! (map-get? distribution-centers { center-id: center-id }) err-not-found))
+  )
+    (ok {
+      center-id: center-id,
+      center-name: (get name center),
+      active: (get active center)
+    })
+  )
+)
+
+(define-read-only (is-equipment-maintenance-overdue (equipment-id uint))
+  (let (
+    (equip (unwrap! (map-get? equipment { equipment-id: equipment-id }) false))
+    (current-block stacks-block-height)
+  )
+    (< (get next-maintenance equip) current-block)
+  )
+)
+
+(define-read-only (get-equipment-efficiency (equipment-id uint))
+  (let (
+    (equip (unwrap! (map-get? equipment { equipment-id: equipment-id }) err-equipment-not-found))
+    (age-blocks (- stacks-block-height (get purchase-date equip)))
+    (maintenance-ratio (if (> age-blocks u0) (/ (* (get maintenance-count equip) u100) age-blocks) u0))
+  )
+    (ok {
+      equipment-id: equipment-id,
+      age-blocks: age-blocks,
+      maintenance-ratio: maintenance-ratio,
+      cost-per-maintenance: (if (> (get maintenance-count equip) u0) (/ (get total-maintenance-cost equip) (get maintenance-count equip)) u0),
+      condition: (get condition equip)
+    })
   )
 )
