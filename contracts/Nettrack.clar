@@ -16,11 +16,19 @@
 (define-constant err-equipment-maintenance-overdue (err u111))
 (define-constant err-equipment-inactive (err u112))
 (define-constant err-invalid-equipment-type (err u113))
+(define-constant err-batch-not-found (err u114))
+(define-constant err-invalid-batch-status (err u115))
+(define-constant err-batch-already-shipped (err u116))
+(define-constant err-invalid-manufacturer (err u117))
+(define-constant err-batch-expired (err u118))
+(define-constant err-insufficient-batch-quantity (err u119))
 
 (define-data-var total-nets-distributed uint u0)
 (define-data-var total-distribution-centers uint u0)
 (define-data-var contract-active bool true)
 (define-data-var total-equipment uint u0)
+(define-data-var total-batches uint u0)
+(define-data-var total-shipments uint u0)
 
 (define-map distribution-centers
   { center-id: uint }
@@ -126,6 +134,70 @@
 
 (define-data-var next-maintenance-record-id uint u1)
 (define-data-var next-alert-id uint u1)
+
+(define-map net-batches
+  { batch-id: uint }
+  {
+    manufacturer: (string-ascii 100),
+    manufacturing-date: uint,
+    expiry-date: uint,
+    batch-size: uint,
+    remaining-quantity: uint,
+    quality-grade: (string-ascii 20),
+    insecticide-type: (string-ascii 50),
+    batch-code: (string-ascii 50),
+    status: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-map shipments
+  { shipment-id: uint }
+  {
+    batch-id: uint,
+    from-location: (string-ascii 100),
+    to-center-id: uint,
+    quantity: uint,
+    shipped-date: uint,
+    expected-delivery: uint,
+    actual-delivery: (optional uint),
+    status: (string-ascii 20),
+    tracking-code: (string-ascii 50),
+    transport-method: (string-ascii 50),
+    shipped-by: principal,
+    received-by: (optional principal)
+  }
+)
+
+(define-map batch-quality-tests
+  { test-id: uint }
+  {
+    batch-id: uint,
+    test-type: (string-ascii 50),
+    test-date: uint,
+    test-result: (string-ascii 20),
+    tested-by: principal,
+    notes: (string-ascii 200),
+    compliance-standard: (string-ascii 50)
+  }
+)
+
+(define-map supply-chain-events
+  { event-id: uint }
+  {
+    batch-id: uint,
+    event-type: (string-ascii 50),
+    location: (string-ascii 100),
+    timestamp: uint,
+    details: (string-ascii 200),
+    recorded-by: principal
+  }
+)
+
+(define-data-var next-batch-id uint u1)
+(define-data-var next-shipment-id uint u1)
+(define-data-var next-test-id uint u1)
+(define-data-var next-event-id uint u1)
 
 (define-public (initialize-contract)
   (begin
@@ -633,3 +705,256 @@
     })
   )
 )
+
+(define-public (create-net-batch (manufacturer (string-ascii 100)) (batch-size uint) (expiry-blocks uint) (quality-grade (string-ascii 20)) (insecticide-type (string-ascii 50)) (batch-code (string-ascii 50)))
+  (let (
+    (batch-id (var-get next-batch-id))
+    (expiry-date (+ stacks-block-height expiry-blocks))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> (len manufacturer) u0) err-invalid-manufacturer)
+    (asserts! (> batch-size u0) err-invalid-batch-status)
+    (asserts! (> (len quality-grade) u0) err-invalid-batch-status)
+    (asserts! (> (len batch-code) u0) err-invalid-batch-status)
+    (asserts! (> expiry-blocks u0) err-invalid-batch-status)
+    
+    (map-set net-batches
+      { batch-id: batch-id }
+      {
+        manufacturer: manufacturer,
+        manufacturing-date: stacks-block-height,
+        expiry-date: expiry-date,
+        batch-size: batch-size,
+        remaining-quantity: batch-size,
+        quality-grade: quality-grade,
+        insecticide-type: insecticide-type,
+        batch-code: batch-code,
+        status: "manufactured",
+        created-at: stacks-block-height
+      }
+    )
+    
+    (try! (record-supply-chain-event batch-id "batch-created" "manufacturing-facility" "Batch manufactured and recorded"))
+    (var-set next-batch-id (+ batch-id u1))
+    (var-set total-batches (+ (var-get total-batches) u1))
+    (ok batch-id)
+  )
+)
+
+(define-public (ship-batch (batch-id uint) (to-center-id uint) (quantity uint) (from-location (string-ascii 100)) (tracking-code (string-ascii 50)) (transport-method (string-ascii 50)) (expected-delivery-blocks uint))
+  (let (
+    (batch (unwrap! (map-get? net-batches { batch-id: batch-id }) err-batch-not-found))
+    (center (unwrap! (map-get? distribution-centers { center-id: to-center-id }) err-not-found))
+    (shipment-id (var-get next-shipment-id))
+    (expected-delivery (+ stacks-block-height expected-delivery-blocks))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= (get remaining-quantity batch) quantity) err-insufficient-batch-quantity)
+    (asserts! (or (is-eq (get status batch) "manufactured") (is-eq (get status batch) "partially-shipped")) err-batch-already-shipped)
+    (asserts! (< stacks-block-height (get expiry-date batch)) err-batch-expired)
+    (asserts! (> quantity u0) err-invalid-batch-status)
+    (asserts! (> (len tracking-code) u0) err-invalid-batch-status)
+    
+    (map-set shipments
+      { shipment-id: shipment-id }
+      {
+        batch-id: batch-id,
+        from-location: from-location,
+        to-center-id: to-center-id,
+        quantity: quantity,
+        shipped-date: stacks-block-height,
+        expected-delivery: expected-delivery,
+        actual-delivery: none,
+        status: "in-transit",
+        tracking-code: tracking-code,
+        transport-method: transport-method,
+        shipped-by: tx-sender,
+        received-by: none
+      }
+    )
+    
+    (map-set net-batches
+      { batch-id: batch-id }
+      (merge batch {
+        remaining-quantity: (- (get remaining-quantity batch) quantity),
+        status: (if (is-eq (- (get remaining-quantity batch) quantity) u0) "shipped" "partially-shipped")
+      })
+    )
+    
+    (try! (record-supply-chain-event batch-id "shipment-created" from-location "Batch shipped to distribution center"))
+    (var-set next-shipment-id (+ shipment-id u1))
+    (var-set total-shipments (+ (var-get total-shipments) u1))
+    (ok shipment-id)
+  )
+)
+
+(define-public (receive-shipment (shipment-id uint))
+  (let (
+    (shipment (unwrap! (map-get? shipments { shipment-id: shipment-id }) err-not-found))
+    (batch (unwrap! (map-get? net-batches { batch-id: (get batch-id shipment) }) err-batch-not-found))
+    (center (unwrap! (map-get? distribution-centers { center-id: (get to-center-id shipment) }) err-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-eq (get status shipment) "in-transit") err-invalid-batch-status)
+    
+    (map-set shipments
+      { shipment-id: shipment-id }
+      (merge shipment {
+        status: "delivered",
+        actual-delivery: (some stacks-block-height),
+        received-by: (some tx-sender)
+      })
+    )
+    
+    (map-set distribution-centers
+      { center-id: (get to-center-id shipment) }
+      (merge center {
+        stock: (+ (get stock center) (get quantity shipment))
+      })
+    )
+    
+    (try! (record-supply-chain-event (get batch-id shipment) "shipment-received" (get name center) "Shipment received at distribution center"))
+    (ok true)
+  )
+)
+
+(define-public (perform-quality-test (batch-id uint) (test-type (string-ascii 50)) (test-result (string-ascii 20)) (notes (string-ascii 200)) (compliance-standard (string-ascii 50)))
+  (let (
+    (batch (unwrap! (map-get? net-batches { batch-id: batch-id }) err-batch-not-found))
+    (test-id (var-get next-test-id))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> (len test-type) u0) err-invalid-batch-status)
+    (asserts! (> (len test-result) u0) err-invalid-batch-status)
+    
+    (map-set batch-quality-tests
+      { test-id: test-id }
+      {
+        batch-id: batch-id,
+        test-type: test-type,
+        test-date: stacks-block-height,
+        test-result: test-result,
+        tested-by: tx-sender,
+        notes: notes,
+        compliance-standard: compliance-standard
+      }
+    )
+    
+    (try! (record-supply-chain-event batch-id "quality-test" "quality-lab" (concat-strings "Quality test performed: " test-result)))
+    (var-set next-test-id (+ test-id u1))
+    (ok test-id)
+  )
+)
+
+(define-public (record-supply-chain-event (batch-id uint) (event-type (string-ascii 50)) (location (string-ascii 100)) (details (string-ascii 200)))
+  (let (
+    (batch (unwrap! (map-get? net-batches { batch-id: batch-id }) err-batch-not-found))
+    (event-id (var-get next-event-id))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> (len event-type) u0) err-invalid-batch-status)
+    (asserts! (> (len location) u0) err-invalid-batch-status)
+    
+    (map-set supply-chain-events
+      { event-id: event-id }
+      {
+        batch-id: batch-id,
+        event-type: event-type,
+        location: location,
+        timestamp: stacks-block-height,
+        details: details,
+        recorded-by: tx-sender
+      }
+    )
+    
+    (var-set next-event-id (+ event-id u1))
+    (ok event-id)
+  )
+)
+
+(define-public (expire-batch (batch-id uint))
+  (let (
+    (batch (unwrap! (map-get? net-batches { batch-id: batch-id }) err-batch-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= stacks-block-height (get expiry-date batch)) err-invalid-batch-status)
+    
+    (map-set net-batches
+      { batch-id: batch-id }
+      (merge batch { status: "expired" })
+    )
+    
+    (try! (record-supply-chain-event batch-id "batch-expired" "system" "Batch expired and marked as unusable"))
+    (ok true)
+  )
+)
+
+(define-read-only (get-batch (batch-id uint))
+  (map-get? net-batches { batch-id: batch-id })
+)
+
+(define-read-only (get-shipment (shipment-id uint))
+  (map-get? shipments { shipment-id: shipment-id })
+)
+
+(define-read-only (get-quality-test (test-id uint))
+  (map-get? batch-quality-tests { test-id: test-id })
+)
+
+(define-read-only (get-supply-chain-event (event-id uint))
+  (map-get? supply-chain-events { event-id: event-id })
+)
+
+(define-read-only (get-batch-traceability (batch-id uint))
+  (let (
+    (batch (unwrap! (map-get? net-batches { batch-id: batch-id }) err-batch-not-found))
+  )
+    (ok {
+      batch-info: batch,
+      is-expired: (>= stacks-block-height (get expiry-date batch)),
+      age-blocks: (- stacks-block-height (get manufacturing-date batch)),
+      utilization-rate: (if (> (get batch-size batch) u0) (/ (* (- (get batch-size batch) (get remaining-quantity batch)) u100) (get batch-size batch)) u0)
+    })
+  )
+)
+
+(define-read-only (get-shipment-status (tracking-code (string-ascii 50)))
+  (let (
+    (shipment-found none)
+  )
+    (ok {
+      tracking-code: tracking-code,
+      status: "not-found"
+    })
+  )
+)
+
+(define-read-only (get-total-batches)
+  (var-get total-batches)
+)
+
+(define-read-only (get-total-shipments)
+  (var-get total-shipments)
+)
+
+(define-read-only (get-batch-quality-summary (batch-id uint))
+  (let (
+    (batch (unwrap! (map-get? net-batches { batch-id: batch-id }) err-batch-not-found))
+  )
+    (ok {
+      batch-id: batch-id,
+      quality-grade: (get quality-grade batch),
+      insecticide-type: (get insecticide-type batch),
+      manufacturing-date: (get manufacturing-date batch),
+      expiry-date: (get expiry-date batch),
+      is-expired: (>= stacks-block-height (get expiry-date batch)),
+      manufacturer: (get manufacturer batch)
+    })
+  )
+)
+
+(define-private (concat-strings (str1 (string-ascii 200)) (str2 (string-ascii 200)))
+  str1
+)
+
+
